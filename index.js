@@ -1,12 +1,26 @@
 /* =========================================================
-   PROFESSIONAL WHATSAPP SERVER (RENDER SAFE FIXED)
+   PROFESSIONAL WHATSAPP SERVER (ULTIMATE RENDER SAFE)
+   =========================================================
+
+   FEATURES:
    - One-time pairing
    - Persistent session
    - Refresh safe UI
    - Render compatible
    - LINE-BY-LINE sending
    - Prefix support
-   - 10s default delay
+   - Exact delay timing
+   - Persistent frontend logs
+   - Restart button
+   - Auto reconnect
+   - Pair crash auto repair
+   - Ghost socket prevention
+   - Multi-start protection
+   - Memory leak prevention
+   - Render RAM optimization
+   - Stable reconnect logic
+   - Session persistence
+
 ========================================================= */
 
 import express from "express";
@@ -53,20 +67,117 @@ const SESSION_PATH =
   process.env.SESSION_PATH || "./session";
 
 if (!fs.existsSync(SESSION_PATH)) {
+
   fs.mkdirSync(SESSION_PATH, {
     recursive: true
   });
+
 }
 
 /* ================= GLOBAL ================= */
 
 let sock = null;
 
+let connectedNumber = "";
+
 let isConnected = false;
 
 let isReconnecting = false;
 
+let restartLock = false;
+
 let stopSending = false;
+
+let sendingActive = false;
+
+let currentLoop = null;
+
+let liveLogs = [];
+
+/* ================= LOGGER ================= */
+
+function pushLog(text) {
+
+  console.log(text);
+
+  liveLogs.push(text);
+
+  if (liveLogs.length > 300) {
+    liveLogs.shift();
+  }
+
+  io.emit("log", text);
+}
+
+/* ================= FULL RESTART ================= */
+
+async function fullRestart(reason = "Manual restart") {
+
+  if (restartLock) {
+    return;
+  }
+
+  restartLock = true;
+
+  pushLog(`Restarting server: ${reason}`);
+
+  try {
+
+    stopSending = true;
+
+    sendingActive = false;
+
+    if (currentLoop) {
+      clearTimeout(currentLoop);
+      currentLoop = null;
+    }
+
+    if (sock) {
+
+      try {
+        sock.ws.close();
+      } catch {}
+
+      try {
+        sock.end();
+      } catch {}
+
+      sock = null;
+    }
+
+    isConnected = false;
+
+    isReconnecting = false;
+
+    io.emit("status", "Restarting");
+
+    setTimeout(async () => {
+
+      try {
+
+        await startWhatsApp();
+
+      } catch (e) {
+
+        pushLog(
+          "Restart startup failed: " +
+          e.message
+        );
+      }
+
+      restartLock = false;
+
+    }, 5000);
+
+  } catch (err) {
+
+    restartLock = false;
+
+    pushLog(
+      "Restart failed: " + err.message
+    );
+  }
+}
 
 /* ================= HTML ================= */
 
@@ -76,7 +187,7 @@ const html = `
 
 <head>
 
-<meta charset="UTF-8">
+<meta charset="UTF-8"/>
 
 <meta
   name="viewport"
@@ -99,7 +210,7 @@ body{
 .card{
   background:#111827;
   width:100%;
-  max-width:650px;
+  max-width:700px;
   border-radius:20px;
   padding:20px;
 }
@@ -130,10 +241,15 @@ button{
   color:white;
 }
 
+.restart{
+  background:#3b82f6;
+  color:white;
+}
+
 #logs{
   background:black;
   color:#22c55e;
-  height:220px;
+  height:250px;
   overflow:auto;
   padding:10px;
   margin-top:15px;
@@ -192,7 +308,7 @@ Login required
 
 <input
   id="delay"
-  placeholder="Delay in seconds (default 10)"
+  placeholder="Delay in seconds (minimum 10)"
 />
 
 <input
@@ -212,6 +328,13 @@ START
 STOP
 </button>
 
+<button
+  class="restart"
+  onclick="restartServer()"
+>
+RESTART SERVER
+</button>
+
 <div id="logs"></div>
 
 </div>
@@ -224,19 +347,37 @@ const socket = io();
 
 let msgs = "";
 
+socket.on("session", data => {
+
+  if(data.connected){
+
+    status.innerText =
+      "Status: Connected";
+
+    pairBox.innerText =
+      "Linked: " + data.number;
+  }
+
+});
+
 function addLog(text){
 
-  logs.innerHTML += "<div>> " + text + "</div>";
+  logs.innerHTML +=
+    "<div>> " + text + "</div>";
 
-  logs.scrollTop = logs.scrollHeight;
+  logs.scrollTop =
+    logs.scrollHeight;
 }
 
 function pair(){
 
-  const num = phone.value.trim();
+  const num =
+    phone.value.trim();
 
   if(!num){
+
     alert("Enter phone number");
+
     return;
   }
 
@@ -248,19 +389,32 @@ function stopSend(){
   socket.emit("stop");
 }
 
+function restartServer(){
+
+  socket.emit("restart");
+}
+
 function startSend(){
 
   socket.emit("start", {
-    target: target.value.trim(),
-    prefix: prefix.value.trim(),
-    delay: delay.value.trim(),
+
+    target:
+      target.value.trim(),
+
+    prefix:
+      prefix.value.trim(),
+
+    delay:
+      delay.value.trim(),
+
     msgs
   });
 }
 
 socket.on("status", s => {
 
-  status.innerText = "Status: " + s;
+  status.innerText =
+    "Status: " + s;
 });
 
 socket.on("code", c => {
@@ -288,6 +442,7 @@ socket.on("groups", arr => {
     div.innerText = g.subject;
 
     div.onclick = () => {
+
       target.value = g.id;
     };
 
@@ -310,7 +465,9 @@ file.onchange = e => {
 
     msgs = reader.result || "";
 
-    addLog("Text file loaded");
+    addLog(
+      "Text file loaded successfully"
+    );
   };
 
   reader.readAsText(fileObj);
@@ -331,6 +488,19 @@ app.get("/", (req, res) => {
 async function startWhatsApp() {
 
   try {
+
+    if (sock) {
+
+      try {
+        sock.ws.close();
+      } catch {}
+
+      try {
+        sock.end();
+      } catch {}
+
+      sock = null;
+    }
 
     const {
       state,
@@ -355,7 +525,19 @@ async function startWhatsApp() {
       logger:
         pino({
           level: "silent"
-        })
+        }),
+
+      markOnlineOnConnect: false,
+
+      syncFullHistory: false,
+
+      generateHighQualityLinkPreview: false,
+
+      defaultQueryTimeoutMs: 60000,
+
+      connectTimeoutMs: 60000,
+
+      keepAliveIntervalMs: 10000
     });
 
     sock.ev.on(
@@ -378,7 +560,10 @@ async function startWhatsApp() {
 
           isReconnecting = false;
 
-          console.log(
+          connectedNumber =
+            sock?.user?.id || "";
+
+          pushLog(
             "WhatsApp Connected"
           );
 
@@ -406,10 +591,14 @@ async function startWhatsApp() {
               list
             );
 
+            pushLog(
+              `Loaded ${list.length} groups`
+            );
+
           } catch (e) {
 
-            console.log(
-              "Group fetch failed:",
+            pushLog(
+              "Group fetch failed: " +
               e.message
             );
           }
@@ -424,7 +613,7 @@ async function startWhatsApp() {
             "Disconnected"
           );
 
-          console.log(
+          pushLog(
             "Connection closed"
           );
 
@@ -447,12 +636,16 @@ async function startWhatsApp() {
               "Reconnecting"
             );
 
-            console.log(
-              "Reconnecting in 5s..."
+            pushLog(
+              "Reconnecting in 5 seconds..."
             );
 
-            setTimeout(() => {
-              startWhatsApp();
+            setTimeout(async () => {
+
+              await fullRestart(
+                "Auto reconnect"
+              );
+
             }, 5000);
           }
         }
@@ -462,13 +655,17 @@ async function startWhatsApp() {
 
   } catch (err) {
 
-    console.error(
-      "START ERROR:",
-      err
+    pushLog(
+      "START ERROR: " +
+      err.message
     );
 
-    setTimeout(() => {
-      startWhatsApp();
+    setTimeout(async () => {
+
+      await fullRestart(
+        "Startup failure"
+      );
+
     }, 5000);
   }
 }
@@ -478,6 +675,15 @@ startWhatsApp();
 /* ================= SOCKET ================= */
 
 io.on("connection", socket => {
+
+  socket.emit("session", {
+    connected: isConnected,
+    number: connectedNumber
+  });
+
+  liveLogs.forEach(log => {
+    socket.emit("log", log);
+  });
 
   socket.emit(
     "status",
@@ -489,6 +695,20 @@ io.on("connection", socket => {
       : "Disconnected"
   );
 
+  /* ================= RESTART ================= */
+
+  socket.on("restart", async () => {
+
+    pushLog(
+      "Manual restart requested"
+    );
+
+    await fullRestart(
+      "Panel restart button"
+    );
+
+  });
+
   /* ================= PAIR ================= */
 
   socket.on("pair", async raw => {
@@ -497,8 +717,7 @@ io.on("connection", socket => {
 
       if (!sock) {
 
-        socket.emit(
-          "log",
+        pushLog(
           "Socket not ready"
         );
 
@@ -507,8 +726,7 @@ io.on("connection", socket => {
 
       if (isConnected) {
 
-        socket.emit(
-          "log",
+        pushLog(
           "Already connected"
         );
 
@@ -517,17 +735,24 @@ io.on("connection", socket => {
 
       const phone =
         String(raw || "")
-          .replace(/\D/g, "");
+        .replace(/\D/g, "");
 
       if (!phone) {
 
-        socket.emit(
-          "log",
-          "Invalid number"
+        pushLog(
+          "Invalid phone number"
         );
 
         return;
       }
+
+      pushLog(
+        "Preparing pairing..."
+      );
+
+      await new Promise(resolve =>
+        setTimeout(resolve, 4000)
+      );
 
       const code =
         await sock.requestPairingCode(
@@ -539,17 +764,31 @@ io.on("connection", socket => {
         code
       );
 
-      socket.emit(
-        "log",
-        "Pair code generated"
+      pushLog(
+        "Pair code generated successfully"
       );
 
     } catch (err) {
 
-      socket.emit(
-        "log",
-        "Pair failed: " + err.message
+      pushLog(
+        "Pair failed: " +
+        (err?.message || err)
       );
+
+      if (
+        String(err)
+          .toLowerCase()
+          .includes("closed")
+      ) {
+
+        pushLog(
+          "Repairing socket..."
+        );
+
+        await fullRestart(
+          "Pairing crash"
+        );
+      }
     }
 
   });
@@ -562,9 +801,17 @@ io.on("connection", socket => {
 
       if (!sock || !isConnected) {
 
-        socket.emit(
-          "log",
+        pushLog(
           "WhatsApp not connected"
+        );
+
+        return;
+      }
+
+      if (sendingActive) {
+
+        pushLog(
+          "Already sending messages"
         );
 
         return;
@@ -575,8 +822,7 @@ io.on("connection", socket => {
         !cfg.target.includes("@")
       ) {
 
-        socket.emit(
-          "log",
+        pushLog(
           "Invalid target JID"
         );
 
@@ -586,8 +832,6 @@ io.on("connection", socket => {
       const rawText =
         String(cfg.msgs || "");
 
-      /* ================= LINE SPLIT ================= */
-
       const lines = rawText
         .split("\n")
         .map(x => x.trim())
@@ -595,8 +839,7 @@ io.on("connection", socket => {
 
       if (!lines.length) {
 
-        socket.emit(
-          "log",
+        pushLog(
           "No valid lines found"
         );
 
@@ -605,14 +848,15 @@ io.on("connection", socket => {
 
       stopSending = false;
 
+      sendingActive = true;
+
       const delayMs =
         Math.max(
           10,
           parseInt(cfg.delay) || 10
         ) * 1000;
 
-      socket.emit(
-        "log",
+      pushLog(
         `Loaded ${lines.length} lines | Delay ${delayMs / 1000}s`
       );
 
@@ -620,10 +864,14 @@ io.on("connection", socket => {
 
       async function sendNext() {
 
-        if (stopSending) {
+        if (
+          stopSending ||
+          !sendingActive
+        ) {
 
-          socket.emit(
-            "log",
+          sendingActive = false;
+
+          pushLog(
             "Stopped successfully"
           );
 
@@ -645,8 +893,7 @@ io.on("connection", socket => {
             { text }
           );
 
-          socket.emit(
-            "log",
+          pushLog(
             `Sent line ${index + 1}/${lines.length}`
           );
 
@@ -654,38 +901,36 @@ io.on("connection", socket => {
             (index + 1) %
             lines.length;
 
-          const extra =
-            Math.floor(
-              Math.random() * 3000
+          currentLoop =
+            setTimeout(
+              sendNext,
+              delayMs
             );
-
-          setTimeout(
-            sendNext,
-            delayMs + extra
-          );
 
         } catch (err) {
 
-          socket.emit(
-            "log",
-            "Send failed: " + err.message
+          pushLog(
+            "Send failed: " +
+            err.message
           );
 
-          setTimeout(
-            sendNext,
-            delayMs
-          );
+          currentLoop =
+            setTimeout(
+              sendNext,
+              delayMs
+            );
         }
-
       }
 
       sendNext();
 
     } catch (err) {
 
-      socket.emit(
-        "log",
-        "Start failed: " + err.message
+      sendingActive = false;
+
+      pushLog(
+        "Start failed: " +
+        err.message
       );
     }
 
@@ -697,9 +942,17 @@ io.on("connection", socket => {
 
     stopSending = true;
 
-    socket.emit(
-      "log",
-      "Stopping..."
+    sendingActive = false;
+
+    if (currentLoop) {
+
+      clearTimeout(currentLoop);
+
+      currentLoop = null;
+    }
+
+    pushLog(
+      "Stopping sender..."
     );
 
   });
@@ -711,7 +964,8 @@ io.on("connection", socket => {
 server.listen(PORT, () => {
 
   console.log(
-    "Server running on port " + PORT
+    "Server running on port " +
+    PORT
   );
 
 });
